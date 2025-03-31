@@ -150,7 +150,7 @@ class BusinessNameGenerator:
         try:
             # Updated to use OpenAI v1.0+ API
             response = client.chat.completions.create(
-                model="gpt-4",
+                model="gpt-3.5-turbo",
                 messages=[
                     {
                         "role": "system",
@@ -170,7 +170,7 @@ class BusinessNameGenerator:
                     },
                     {
                         "role": "user",
-                        "content": f"Create 10 COMPLETELY UNIQUE business names for this description, ensuring ZERO similarity between names: '{description}'. For each name, provide a 10-word description of why it's appropriate."
+                        "content": f"Create 12 COMPLETELY UNIQUE business names for this description, ensuring ZERO similarity between names: '{description}'. For each name, provide a 10-word description of why it's appropriate."
                     }
                 ],
                 max_tokens=500,
