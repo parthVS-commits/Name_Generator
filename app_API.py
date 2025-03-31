@@ -208,7 +208,7 @@ class BusinessNameGenerator:
                 # Check if name exists in database
                 if not NameValidator.name_exists_in_database(name):
                     unique_suggestions.append(suggestion)
-                    if len(unique_suggestions) == 6:
+                    if len(unique_suggestions) == 12:
                         break
             
             return unique_suggestions
