@@ -7,6 +7,9 @@ import pinecone
 from pinecone import Pinecone, ServerlessSpec
 import json
 from openai import OpenAI  # Updated import for OpenAI v1.0+
+import threading
+import concurrent.futures
+from queue import Queue
 
 # Load environment variables
 load_dotenv()
@@ -25,25 +28,29 @@ trademark_index_name = os.getenv("TRADEMARK_INDEX_NAME", "tm-prod-pipeline")
 primary_index = None
 trademark_index = None
 
+# Lock for thread-safe operations
+pinecone_lock = threading.Lock()
+
 def verify_indexes():
     """Verify both indexes are accessible and return connection status"""
     global primary_index, trademark_index
     
-    # Try connecting to primary index
-    try:
-        primary_index = pc.Index(primary_index_name)
-        # Just initialize the connection without any test query
-    except Exception:
-        # Silently handle the error
-        pass
+    # Define a function to connect to an index in a separate thread
+    def connect_to_index(index_name):
+        try:
+            return pc.Index(index_name)
+        except Exception:
+            return None
     
-    # Try connecting to trademark index
-    try:
-        trademark_index = pc.Index(trademark_index_name)
-        # Just initialize the connection without any test query
-    except Exception:
-        # Silently handle the error
-        pass
+    # Create threads for connecting to each index
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        primary_future = executor.submit(connect_to_index, primary_index_name)
+        trademark_future = executor.submit(connect_to_index, trademark_index_name)
+        
+        # Get the results
+        global primary_index, trademark_index
+        primary_index = primary_future.result()
+        trademark_index = trademark_future.result()
 
 class NameValidator:
     @staticmethod
@@ -57,18 +64,13 @@ class NameValidator:
         Returns:
             bool: True if the name exists, False otherwise
         """
-        # Check primary index (original format)
-        primary_result = NameValidator._check_primary_index(name)
-        if primary_result:
-            return True
+        # Create threads to check both indexes simultaneously
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            primary_future = executor.submit(NameValidator._check_primary_index, name)
+            trademark_future = executor.submit(NameValidator._check_trademark_index, name)
             
-        # Check trademark index (wordMark format)
-        trademark_result = NameValidator._check_trademark_index(name)
-        if trademark_result:
-            return True
-            
-        # Name doesn't exist in either index
-        return False
+            # If either check returns True, the name exists
+            return primary_future.result() or trademark_future.result()
         
     @staticmethod
     def _check_primary_index(name: str) -> bool:
@@ -79,19 +81,20 @@ class NameValidator:
             return False  # Assume name doesn't exist if we can't check
             
         try:
-            # Query the index for exact match on original_data field
-            results = primary_index.query(
-                vector=[0] * 1536,  # Dummy vector, we're only checking metadata
-                top_k=1,
-                include_metadata=True,
-                filter={
-                    "original_data": {"$eq": name}
-                }
-            )
-            
-            # Return True if any matching records found
-            exists = len(results.matches) > 0
-            return exists
+            with pinecone_lock:  # Use a lock to ensure thread-safe Pinecone operations
+                # Query the index for exact match on original_data field
+                results = primary_index.query(
+                    vector=[0] * 1536,  # Dummy vector, we're only checking metadata
+                    top_k=1,
+                    include_metadata=True,
+                    filter={
+                        "original_data": {"$eq": name}
+                    }
+                )
+                
+                # Return True if any matching records found
+                exists = len(results.matches) > 0
+                return exists
             
         except Exception:
             # Silently handle the error
@@ -106,34 +109,35 @@ class NameValidator:
             return False  # Assume name doesn't exist if we can't check
             
         try:
-            # Extract the main business name part before any dash or special character
-            # This handles cases like "BusinessName - Tagline"
-            main_name = name.split('-')[0].strip()
-            
-            # Query the trademark index looking for wordMark field
-            results = trademark_index.query(
-                vector=[0] * 1536,  # Dummy vector, we're only checking metadata
-                top_k=10,  # Check a few potential matches
-                include_metadata=True
-            )
-            
-            # Check if any of the returned wordMarks contain our name or vice versa
-            for match in results.matches:
-                if 'wordMark' in match.metadata:
-                    trademark = match.metadata['wordMark']
-                    
-                    # Extract the main part of the trademark before any dash
-                    if ' - ' in trademark:
-                        trademark_main = trademark.split(' - ')[0].strip()
-                    else:
-                        trademark_main = trademark
-                    
-                    # Check if the main parts of the names are the same or very similar
-                    if (main_name.lower() in trademark_main.lower() or 
-                        trademark_main.lower() in main_name.lower()):
-                        return True
-            
-            return False
+            with pinecone_lock:  # Use a lock to ensure thread-safe Pinecone operations
+                # Extract the main business name part before any dash or special character
+                # This handles cases like "BusinessName - Tagline"
+                main_name = name.split('-')[0].strip()
+                
+                # Query the trademark index looking for wordMark field
+                results = trademark_index.query(
+                    vector=[0] * 1536,  # Dummy vector, we're only checking metadata
+                    top_k=10,  # Check a few potential matches
+                    include_metadata=True
+                )
+                
+                # Check if any of the returned wordMarks contain our name or vice versa
+                for match in results.matches:
+                    if 'wordMark' in match.metadata:
+                        trademark = match.metadata['wordMark']
+                        
+                        # Extract the main part of the trademark before any dash
+                        if ' - ' in trademark:
+                            trademark_main = trademark.split(' - ')[0].strip()
+                        else:
+                            trademark_main = trademark
+                        
+                        # Check if the main parts of the names are the same or very similar
+                        if (main_name.lower() in trademark_main.lower() or 
+                            trademark_main.lower() in main_name.lower()):
+                            return True
+                
+                return False
             
         except Exception:
             # Silently handle the error
@@ -146,7 +150,7 @@ class BusinessNameGenerator:
         try:
             # Updated to use OpenAI v1.0+ API
             response = client.chat.completions.create(
-                model="gpt-4",
+                model="gpt-3.5-turbo",
                 messages=[
                     {
                         "role": "system",
@@ -166,7 +170,7 @@ class BusinessNameGenerator:
                     },
                     {
                         "role": "user",
-                        "content": f"Create 10 COMPLETELY UNIQUE business names for this description, ensuring ZERO similarity between names: '{description}'. For each name, provide a 10-word description of why it's appropriate."
+                        "content": f"Create 12 COMPLETELY UNIQUE business names for this description, ensuring ZERO similarity between names: '{description}'. For each name, provide a 10-word description of why it's appropriate."
                     }
                 ],
                 max_tokens=500,
@@ -193,25 +197,29 @@ class BusinessNameGenerator:
                         "description": descriptions[i]
                     })
             
-            # Filter and validate names against database
+            # Filter and validate names against database using parallel processing
             unique_suggestions = []
-            for suggestion in suggestions:
+            
+            def validate_name(suggestion):
                 name = suggestion["name"]
-                # Skip duplicates
-                if name in [s["name"] for s in unique_suggestions]:
-                    continue
-                    
                 # Check if name exists in database
                 if not NameValidator.name_exists_in_database(name):
-                    unique_suggestions.append(suggestion)
-                    if len(unique_suggestions) == 6:
-                        break
+                    return suggestion
+                return None
+            
+            # Use ThreadPoolExecutor to validate names in parallel
+            with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+                validation_results = list(executor.map(validate_name, suggestions))
+            
+            # Filter out None results (failed validation)
+            unique_suggestions = [result for result in validation_results if result is not None]
             
             # If we don't have enough valid names, show a warning
             if len(unique_suggestions) < 6:
                 st.warning(f"Some generated names already exist in the database. Showing {len(unique_suggestions)} unique options.")
             
-            return unique_suggestions
+            return unique_suggestions[:12]  # Limit to 6 suggestions
+            
         except Exception as e:
             st.error(f"Error generating business names: {str(e)}")
             return []
@@ -228,8 +236,10 @@ def main():
     if 'generated_names' not in st.session_state:
         st.session_state.generated_names = []
     
-    # Verify index connections silently
-    verify_indexes()
+    # Start index verification in a background thread when app initializes
+    if 'index_verification_started' not in st.session_state:
+        threading.Thread(target=verify_indexes, daemon=True).start()
+        st.session_state.index_verification_started = True
     
     # Custom CSS for professional look
     st.markdown("""
@@ -301,6 +311,13 @@ def main():
         opacity: 0.8 !important;
         font-style: italic !important;
     }
+    
+    /* Loading spinner customization */
+    .stSpinner {
+        text-align: center;
+        max-width: 50px;
+        margin: 0 auto;
+    }
     </style>
     """, unsafe_allow_html=True)
     
@@ -312,10 +329,6 @@ def main():
     st.markdown("### Generate Unique and Creative Business Names")
     st.markdown("##### All suggested names are validated against our database to ensure they are not already in use.")
     
-    # Initialize session state for generated names only (removed search count)
-    if 'generated_names' not in st.session_state:
-        st.session_state.generated_names = []
-    
     # Description input with static placeholder
     description = st.text_area(
         "Describe your business idea", 
@@ -323,26 +336,47 @@ def main():
         placeholder="E.g., An innovative coffee shop with a modern twist..."
     )
     
-    # Generate Names Button - No longer disabled based on count
+    # Generate Names Button
     generate_button = st.button(
         "Generate Business Names", 
         use_container_width=True
     )
     
+    # Create a placeholder for the progress indicator
+    progress_placeholder = st.empty()
+    
     if generate_button:
         if not description:
             st.warning("Please enter a business description")
         else:
-            with st.spinner("Generating unique business names and validating against existing records..."):
-                generated_names = BusinessNameGenerator.generate_business_names(description)
-                
-                if generated_names:
-                    st.session_state.generated_names = generated_names
+            # Show spinner during processing
+            with progress_placeholder.container():
+                with st.spinner("Generating unique business names and validating against existing records..."):
+                    # Use a thread to generate names
+                    name_queue = Queue()
                     
-                    if len(generated_names) < 6:
-                        st.info("Some generated names were filtered out because they already exist in our database.")
-                else:
-                    st.error("Failed to generate business name suggestions")
+                    def generate_names_thread():
+                        generated_names = BusinessNameGenerator.generate_business_names(description)
+                        name_queue.put(generated_names)
+                    
+                    # Start name generation in a thread
+                    generation_thread = threading.Thread(target=generate_names_thread)
+                    generation_thread.start()
+                    generation_thread.join()  # Wait for the thread to complete
+                    
+                    # Get results from the queue
+                    generated_names = name_queue.get()
+                    
+                    if generated_names:
+                        st.session_state.generated_names = generated_names
+                        
+                        if len(generated_names) < 6:
+                            st.info("Some generated names were filtered out because they already exist in our database.")
+                    else:
+                        st.error("Failed to generate business name suggestions")
+            
+            # Clear the progress indicator
+            progress_placeholder.empty()
     
     # Display Names
     if st.session_state.generated_names:
